@@ -1,7 +1,6 @@
 package org.acme.entity;
 
 import jakarta.persistence.Column;
-import jakarta.persistence.Convert;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
@@ -49,7 +48,7 @@ public class Transaction {
     @Column(name = "exchange_rate", precision = 19, scale = 8)
     public BigDecimal exchangeRate;
 
-    @Convert(converter = TransactionTypeConverter.class)
+    @Enumerated(EnumType.STRING)
     @Column(name = "transaction_type", nullable = false, length = 20)
     public TransactionType type;
 
