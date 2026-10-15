@@ -1,5 +1,6 @@
 package org.acme.resource;
 
+import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
 import jakarta.ws.rs.Consumes;
@@ -18,6 +19,7 @@ import org.acme.dto.request.OpenAccountRequest;
 import org.acme.dto.request.TransferRequest;
 import org.acme.dto.response.AccountResponse;
 import org.acme.dto.response.TransactionResponse;
+import org.acme.security.SecurityRoles;
 import org.acme.service.AccountService;
 import org.acme.service.TransactionService;
 
@@ -36,6 +38,7 @@ public class AccountResource {
     UriInfo uriInfo;
 
     @POST
+    @RolesAllowed({SecurityRoles.CUSTOMER, SecurityRoles.ADMIN})
     public Response open(@Valid OpenAccountRequest request) {
         AccountResponse account = accountService.open(request);
         return Response.created(uriInfo.getAbsolutePathBuilder().path(account.number()).build())
@@ -45,12 +48,14 @@ public class AccountResource {
 
     @GET
     @Path("/{number}")
+    @RolesAllowed({SecurityRoles.CUSTOMER, SecurityRoles.ADMIN})
     public AccountResponse findByNumber(@PathParam("number") String number) {
         return accountService.findByNumber(number);
     }
 
     @DELETE
     @Path("/{number}")
+    @RolesAllowed(SecurityRoles.ADMIN)
     public Response close(@PathParam("number") String number) {
         accountService.close(number);
         return Response.noContent().build();
@@ -58,6 +63,7 @@ public class AccountResource {
 
     @POST
     @Path("/{number}/deposits")
+    @RolesAllowed(SecurityRoles.CUSTOMER)
     public Response deposit(@PathParam("number") String number, @Valid DepositRequest request) {
         TransactionResponse transaction = transactionService.deposit(number, request);
         return transactionCreated(transaction);
@@ -65,6 +71,7 @@ public class AccountResource {
 
     @POST
     @Path("/{number}/transfers")
+    @RolesAllowed(SecurityRoles.CUSTOMER)
     public Response transfer(@PathParam("number") String number, @Valid TransferRequest request) {
         TransactionResponse transaction = transactionService.transfer(number, request);
         return transactionCreated(transaction);
