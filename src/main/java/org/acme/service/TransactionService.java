@@ -18,6 +18,10 @@ import org.acme.mapper.BankMapper;
 import org.acme.repository.AccountRepository;
 import org.acme.repository.TransactionRepository;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.List;
+
 @ApplicationScoped
 public class TransactionService {
 
@@ -29,6 +33,9 @@ public class TransactionService {
 
     @Inject
     BankMapper mapper;
+
+    @Inject
+    ExchangeRateService exchangeRateService;
 
     @Transactional
     public TransactionResponse deposit(String accountNumber, DepositRequest request) {
@@ -57,31 +64,55 @@ public class TransactionService {
                     "Source and destination accounts must be different");
         }
 
+        Account sourceSnapshot = accountRepository.findByNumber(sourceNumber)
+                .orElseThrow(() -> new AccountNotFoundException(sourceNumber));
+        Account destinationSnapshot = accountRepository.findByNumber(destinationNumber)
+                .orElseThrow(() -> new AccountNotFoundException(destinationNumber));
+        ensureActive(sourceSnapshot);
+        ensureActive(destinationSnapshot);
+        if (sourceSnapshot.balance.compareTo(request.amount()) < 0) {
+            throw new InsufficientBalanceException(sourceSnapshot.balance, request.amount());
+        }
+
+        BigDecimal exchangeRate = null;
+        if (sourceSnapshot.currency != destinationSnapshot.currency) {
+            exchangeRate = exchangeRateService.getRate(sourceSnapshot.currency, destinationSnapshot.currency);
+        }
+
         Account first = lockAccount(sourceNumber.compareTo(destinationNumber) < 0 ? sourceNumber : destinationNumber);
         Account second = lockAccount(sourceNumber.compareTo(destinationNumber) < 0 ? destinationNumber : sourceNumber);
         Account source = first.number.equals(sourceNumber) ? first : second;
         Account destination = first.number.equals(destinationNumber) ? first : second;
         ensureActive(source);
         ensureActive(destination);
-
-        if (source.currency != destination.currency) {
-            throw new BusinessRuleException("CURRENCY_CONVERSION_NOT_AVAILABLE",
-                    "Transfers between different currencies are not available yet");
+        if (source.currency != sourceSnapshot.currency || destination.currency != destinationSnapshot.currency) {
+            throw new BusinessRuleException("ACCOUNT_CURRENCY_CHANGED",
+                    "An account currency changed while processing the transfer");
         }
         if (source.balance.compareTo(request.amount()) < 0) {
             throw new InsufficientBalanceException(source.balance, request.amount());
         }
 
+        BigDecimal destinationAmount = request.amount();
+        if (exchangeRate != null) {
+            destinationAmount = request.amount().multiply(exchangeRate).setScale(4, RoundingMode.HALF_UP);
+            if (destinationAmount.signum() <= 0) {
+                throw new BusinessRuleException("CONVERTED_AMOUNT_TOO_SMALL",
+                        "The converted amount is below the supported precision");
+            }
+        }
+
         source.balance = source.balance.subtract(request.amount());
-        destination.balance = destination.balance.add(request.amount());
+        destination.balance = destination.balance.add(destinationAmount);
 
         Transaction transaction = new Transaction();
         transaction.sourceAccount = source;
         transaction.destinationAccount = destination;
         transaction.amount = request.amount();
-        transaction.destinationAmount = request.amount();
+        transaction.destinationAmount = destinationAmount;
         transaction.sourceCurrency = source.currency;
         transaction.destinationCurrency = destination.currency;
+        transaction.exchangeRate = exchangeRate;
         transaction.type = TransactionType.TRANSFER;
         transaction.description = request.description();
         transactionRepository.persist(transaction);
@@ -93,6 +124,13 @@ public class TransactionService {
         Transaction transaction = transactionRepository.findByIdOptional(id)
                 .orElseThrow(() -> new TransactionNotFoundException(id));
         return mapper.toResponse(transaction);
+    }
+
+    @Transactional
+    public List<TransactionResponse> listAll() {
+        return transactionRepository.list("order by occurredAt desc").stream()
+                .map(mapper::toResponse)
+                .toList();
     }
 
     private Account lockAccount(String number) {
