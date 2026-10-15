@@ -3,12 +3,12 @@ package org.acme.repository;
 import io.quarkus.test.TestTransaction;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import jakarta.persistence.EntityManager;
 import org.acme.entity.Account;
 import org.acme.entity.Alert;
 import org.acme.entity.Currency;
 import org.acme.entity.Customer;
 import org.acme.entity.Transaction;
-import org.acme.entity.TransactionTypeConverter;
 import org.acme.entity.TransactionType;
 import org.junit.jupiter.api.Test;
 
@@ -34,15 +34,8 @@ class PersistenceRepositoryTest {
     @Inject
     AlertRepository alertRepository;
 
-    @Test
-    void storesTransactionTypesUsingSpanishDatabaseValues() {
-        TransactionTypeConverter converter = new TransactionTypeConverter();
-
-        assertEquals("DEPOSITO", converter.convertToDatabaseColumn(TransactionType.DEPOSIT));
-        assertEquals("TRANSFERENCIA", converter.convertToDatabaseColumn(TransactionType.TRANSFER));
-        assertEquals(TransactionType.DEPOSIT, converter.convertToEntityAttribute("DEPOSITO"));
-        assertEquals(TransactionType.TRANSFER, converter.convertToEntityAttribute("TRANSFERENCIA"));
-    }
+    @Inject
+    EntityManager entityManager;
 
     @Test
     void loadsDemoDataAndFindsAccountsByCustomer() {
@@ -72,6 +65,25 @@ class PersistenceRepositoryTest {
         transaction.occurredAt = now;
         transactionRepository.persistAndFlush(transaction);
 
+        assertEquals("TRANSFER", entityManager.createNativeQuery(
+                        "select transaction_type from transactions where id = :id")
+                .setParameter("id", transaction.id)
+                .getSingleResult());
+
+        Transaction deposit = new Transaction();
+        deposit.destinationAccount = destination;
+        deposit.amount = new BigDecimal("50.00");
+        deposit.destinationAmount = new BigDecimal("50.00");
+        deposit.sourceCurrency = Currency.PEN;
+        deposit.destinationCurrency = Currency.PEN;
+        deposit.type = TransactionType.DEPOSIT;
+        deposit.occurredAt = now;
+        transactionRepository.persistAndFlush(deposit);
+
+        assertEquals("DEPOSIT", entityManager.createNativeQuery(
+                        "select transaction_type from transactions where id = :id")
+                .setParameter("id", deposit.id)
+                .getSingleResult());
         assertTrue(transactionRepository.listByDateRange(now.minusMinutes(1), now.plusMinutes(1))
                 .stream().anyMatch(item -> item.id.equals(transaction.id)));
         assertTrue(transactionRepository.listByAccount(source.number)
