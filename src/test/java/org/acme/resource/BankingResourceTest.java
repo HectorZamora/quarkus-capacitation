@@ -9,12 +9,14 @@ import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
@@ -63,6 +65,9 @@ class BankingResourceTest {
 
     @Test
     void depositsAndTransfersWithinTheSameCurrency() {
+        when(exchangeRateClient.getLatestRates("PEN"))
+                .thenReturn(new ExchangeRatesResponse("success", "PEN",
+                        Map.of("USD", new BigDecimal("0.29000000"))));
         long sourceCustomerId = createCustomer();
         long destinationCustomerId = createCustomer();
         String sourceNumber = openAccount(sourceCustomerId, Currency.PEN);
@@ -192,6 +197,62 @@ class BankingResourceTest {
     }
 
     @Test
+    void publishesHighValueTransfersAndCreatesAntifraudAlerts() throws InterruptedException {
+        when(exchangeRateClient.getLatestRates("PEN"))
+                .thenReturn(new ExchangeRatesResponse("success", "PEN",
+                        Map.of("USD", new BigDecimal("0.29000000"))));
+        String sourceNumber = openAccount(createCustomer(), Currency.PEN);
+        String destinationNumber = openAccount(createCustomer(), Currency.PEN);
+
+        given()
+                .auth().oauth2(customerToken())
+                .contentType("application/json")
+                .body(Map.of("amount", new BigDecimal("25000.00")))
+                .when().post("/accounts/{number}/deposits", sourceNumber)
+                .then().statusCode(201);
+
+        long transactionId = ((Number) given()
+                .auth().oauth2(customerToken())
+                .contentType("application/json")
+                .body(Map.of("destinationAccountNumber", destinationNumber, "amount", new BigDecimal("20000.00")))
+                .when().post("/accounts/{number}/transfers", sourceNumber)
+                .then().statusCode(201)
+                .extract().path("id")).longValue();
+
+        assertTrue(awaitAlertReason(transactionId).contains("Transfer exceeds USD 5000"));
+    }
+
+    @Test
+    void flagsFiveTransfersFromTheSameAccountWithinFiveMinutes() throws InterruptedException {
+        when(exchangeRateClient.getLatestRates("PEN"))
+                .thenReturn(new ExchangeRatesResponse("success", "PEN",
+                        Map.of("USD", new BigDecimal("0.29000000"))));
+        String sourceNumber = openAccount(createCustomer(), Currency.PEN);
+        String destinationNumber = openAccount(createCustomer(), Currency.PEN);
+
+        given()
+                .auth().oauth2(customerToken())
+                .contentType("application/json")
+                .body(Map.of("amount", new BigDecimal("100.00")))
+                .when().post("/accounts/{number}/deposits", sourceNumber)
+                .then().statusCode(201);
+
+        long lastTransactionId = 0;
+        for (int transferNumber = 0; transferNumber < 5; transferNumber++) {
+            lastTransactionId = ((Number) given()
+                    .auth().oauth2(customerToken())
+                    .contentType("application/json")
+                    .body(Map.of("destinationAccountNumber", destinationNumber, "amount", BigDecimal.ONE))
+                    .when().post("/accounts/{number}/transfers", sourceNumber)
+                    .then().statusCode(201)
+                    .extract().path("id")).longValue();
+        }
+
+        assertTrue(awaitAlertReason(lastTransactionId)
+                .contains("Five or more transfers from the same account within five minutes"));
+    }
+
+    @Test
     void closesEmptyAccountsAndReturnsUniformNotFoundErrors() {
         String accountNumber = openAccount(createCustomer(), Currency.USD);
 
@@ -300,6 +361,26 @@ class BankingResourceTest {
                 .then().statusCode(200)
                 .extract().path("balance").toString();
         assertEquals(0, new BigDecimal(balance).compareTo(new BigDecimal(expected)));
+    }
+
+    private String awaitAlertReason(long transactionId) throws InterruptedException {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        String token = adminToken();
+        while (System.nanoTime() < deadline) {
+            List<?> alerts = given()
+                    .auth().oauth2(token)
+                    .when().get("/alerts")
+                    .then().statusCode(200)
+                    .extract().jsonPath().getList("");
+            for (Object item : alerts) {
+                Map<?, ?> alert = (Map<?, ?>) item;
+                if (((Number) alert.get("transactionId")).longValue() == transactionId) {
+                    return alert.get("reason").toString();
+                }
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("No antifraud alert was created for transaction " + transactionId);
     }
 
     private String adminToken() {
