@@ -1,20 +1,25 @@
 package org.acme.service;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
+import org.jboss.logging.Logger;
 import org.acme.dto.request.DepositRequest;
 import org.acme.dto.request.TransferRequest;
 import org.acme.dto.response.TransactionResponse;
 import org.acme.entity.Account;
+import org.acme.entity.Currency;
 import org.acme.entity.Transaction;
 import org.acme.entity.TransactionType;
 import org.acme.exception.AccountNotFoundException;
 import org.acme.exception.BusinessRuleException;
 import org.acme.exception.ConflictException;
+import org.acme.exception.ExchangeRateUnavailableException;
 import org.acme.exception.InsufficientBalanceException;
 import org.acme.exception.TransactionNotFoundException;
 import org.acme.mapper.BankMapper;
+import org.acme.messaging.TransferCompletedEvent;
 import org.acme.repository.AccountRepository;
 import org.acme.repository.TransactionRepository;
 
@@ -24,6 +29,8 @@ import java.util.List;
 
 @ApplicationScoped
 public class TransactionService {
+
+    private static final Logger LOG = Logger.getLogger(TransactionService.class);
 
     @Inject
     AccountRepository accountRepository;
@@ -36,6 +43,9 @@ public class TransactionService {
 
     @Inject
     ExchangeRateService exchangeRateService;
+
+    @Inject
+    Event<TransferCompletedEvent> transferEvents;
 
     @Transactional
     public TransactionResponse deposit(String accountNumber, DepositRequest request) {
@@ -75,8 +85,25 @@ public class TransactionService {
         }
 
         BigDecimal exchangeRate = null;
+        BigDecimal destinationAmount = request.amount();
+        BigDecimal amountInUsd = sourceSnapshot.currency == Currency.USD ? request.amount() : null;
         if (sourceSnapshot.currency != destinationSnapshot.currency) {
             exchangeRate = exchangeRateService.getRate(sourceSnapshot.currency, destinationSnapshot.currency);
+            destinationAmount = request.amount().multiply(exchangeRate).setScale(4, RoundingMode.HALF_UP);
+            if (destinationAmount.signum() <= 0) {
+                throw new BusinessRuleException("CONVERTED_AMOUNT_TOO_SMALL",
+                        "The converted amount is below the supported precision");
+            }
+            if (destinationSnapshot.currency == Currency.USD) {
+                amountInUsd = destinationAmount;
+            }
+        } else if (sourceSnapshot.currency == Currency.PEN) {
+            try {
+                BigDecimal penToUsdRate = exchangeRateService.getRate(Currency.PEN, Currency.USD);
+                amountInUsd = request.amount().multiply(penToUsdRate).setScale(4, RoundingMode.HALF_UP);
+            } catch (ExchangeRateUnavailableException exception) {
+                LOG.warn("Skipping USD-equivalent antifraud check because the exchange-rate provider is unavailable");
+            }
         }
 
         Account first = lockAccount(sourceNumber.compareTo(destinationNumber) < 0 ? sourceNumber : destinationNumber);
@@ -93,15 +120,6 @@ public class TransactionService {
             throw new InsufficientBalanceException(source.balance, request.amount());
         }
 
-        BigDecimal destinationAmount = request.amount();
-        if (exchangeRate != null) {
-            destinationAmount = request.amount().multiply(exchangeRate).setScale(4, RoundingMode.HALF_UP);
-            if (destinationAmount.signum() <= 0) {
-                throw new BusinessRuleException("CONVERTED_AMOUNT_TOO_SMALL",
-                        "The converted amount is below the supported precision");
-            }
-        }
-
         source.balance = source.balance.subtract(request.amount());
         destination.balance = destination.balance.add(destinationAmount);
 
@@ -116,6 +134,18 @@ public class TransactionService {
         transaction.type = TransactionType.TRANSFER;
         transaction.description = request.description();
         transactionRepository.persist(transaction);
+
+        transferEvents.fire(new TransferCompletedEvent(
+                transaction.id,
+                source.number,
+                destination.number,
+                request.amount(),
+                destinationAmount,
+                source.currency,
+                destination.currency,
+                amountInUsd,
+                transaction.occurredAt
+        ));
         return mapper.toResponse(transaction);
     }
 

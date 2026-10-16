@@ -24,4 +24,9 @@ public class TransactionRepository implements PanacheRepository<Transaction> {
         return count("sourceAccount.number = ?1 and type = ?2 and occurredAt >= ?3",
                 sourceAccountNumber, TransactionType.TRANSFER, from);
     }
+
+    public long countTransfersInRange(String sourceAccountNumber, LocalDateTime from, LocalDateTime to) {
+        return count("sourceAccount.number = ?1 and type = ?2 and occurredAt >= ?3 and occurredAt <= ?4",
+                sourceAccountNumber, TransactionType.TRANSFER, from, to);
+    }
 }
