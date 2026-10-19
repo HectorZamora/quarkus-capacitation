@@ -1,90 +1,276 @@
-# code-with-quarkus
+# MiniBanco - API bancaria con Quarkus
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+Proyecto de evidencia para la capacitación de **Quarkus**. Implementa un mini
+banco: gestión de clientes y cuentas, depósitos, transferencias (mismo moneda y
+entre monedas), y un motor antifraude que genera **alertas** a partir de eventos
+de transferencia publicados en **Kafka**.
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+## Proceso de negocio
 
-## Running the application in dev mode
+1. Un **administrador** da de alta clientes y abre cuentas (PEN o USD).
+2. Un **cliente** (rol `CUSTOMER`) deposita y transfiere dinero.
+3. Si la transferencia es entre monedas distintas, la app consulta una **API
+   externa de tipo de cambio** (con tolerancia a fallos) y guarda la tasa aplicada.
+4. Al confirmarse la transacción, se publica un evento en **Kafka**.
+5. Un **consumidor antifraude** evalúa la regla de negocio y, si se cumple,
+   persiste una **Alerta** (consultable solo por administradores).
 
-You can run your application in dev mode that enables live coding using:
+### Diagrama de flujo
 
-```shell script
+```mermaid
+flowchart LR
+    U[Cliente / Admin] -->|JWT Bearer| API[API REST Quarkus]
+    API --> SVC[Servicios @Transactional]
+    SVC --> DB[(PostgreSQL)]
+    SVC -->|monedas distintas| FX[API tipo de cambio<br/>open.er-api.com]
+    SVC -->|transferencia OK| K[(Kafka)]
+    K --> AF[Consumidor antifraude]
+    AF -->|regla cumplida| DB
+    API -->|GET /alerts| DB
+```
+
+```
+ Cliente/Admin ──JWT──▶ REST ──▶ Service @Transactional ──▶ PostgreSQL
+                                    │
+                                    ├─(distinta moneda)─▶ API tipo de cambio (Fallback/Timeout)
+                                    └─(transferencia OK)─▶ Kafka "transfers"
+                                                                   │
+                                                                   ▼
+                                                     Consumidor antifraude
+                                                                   │
+                                                          (regla) ─┴─▶ Alerta (PostgreSQL)
+```
+
+## Stack
+
+| Componente            | Tecnología |
+|-----------------------|------------|
+| Framework             | Quarkus 3.40.1 (Java 21) |
+| Persistencia          | Hibernate ORM + Panache, PostgreSQL |
+| API                   | Quarkus REST (Jakarta REST), DTOs + mappers |
+| Validación            | Hibernate Validator (`@Valid`, `@NotNull`, `@Positive`, ...) |
+| Seguridad             | SmallRye JWT (RSA), `@RolesAllowed` |
+| API externa           | REST Client (MicroProfile) + Fault Tolerance (`@Timeout`, `@Fallback`) |
+| Mensajería            | Kafka (SmallRye Reactive Messaging) |
+| Contenedores          | Podman + podman-compose |
+
+## Estructura de capas
+
+```
+resource/     Endpoints REST (HTTP status, validación, roles)
+service/      Lógica de negocio (@Transactional)
+repository/   PanacheRepository (consultas)
+entity/       Modelo JPA (Customer, Account, Transaction, Alert)
+dto/          request/ y response/ separados de las entidades
+mapper/       BankMapper (entidad -> DTO)
+messaging/    Productor/consumidor Kafka y evento
+client/       ExchangeRateClient (@RegisterRestClient)
+exception/    Excepciones + ExceptionMapper (error JSON uniforme)
+security/     Constantes de roles
+```
+
+## Cómo levantarlo con Podman
+
+### Requisitos
+
+- Podman (con una máquina corriendo: `podman machine start`).
+- Java 21 + Maven Wrapper (incluido `mvnw`).
+
+> El proyecto está configurado para usar **Podman puro**: `podman compose` invoca
+> a **`podman-compose`** (no al `docker-compose` de Docker Desktop). En Windows,
+> instala `podman-compose` con `pip install podman-compose` y registra el proveedor
+> en `%APPDATA%\containers\containers.conf`:
+>
+> ```toml
+> [engine]
+> compose_providers=['C:\ruta\a\Scripts\podman-compose.exe']
+> ```
+
+### Pasos
+
+```bash
+# 1) (Opcional pero recomendado) Autenticarse en Docker Hub para evitar el
+#    límite de descargas anónimas
+podman login docker.io
+
+# 2) Compilar la aplicación (genera target/quarkus-app)
+./mvnw package
+
+# 3) Levantar el stack completo (postgres + kafka + minibanco)
+podman compose -f podman-compose.yml up --build -d
+
+# 4) Ver el estado
+podman compose -f podman-compose.yml ps
+```
+
+La API queda disponible en `http://localhost:8080/api`.
+
+> El `minibanco` se construye con el **`Containerfile`** de la raíz (equivalente
+> al `src/main/docker/Dockerfile.jvm` que genera Quarkus). El comando
+> `podman compose ... up --build -d` ya usa `podman-compose`, por lo que no se
+> requiere Docker. También puedes ejecutar directamente
+> `podman-compose -f podman-compose.yml up --build -d` si tienes `podman-compose`
+> en el `PATH`.
+
+### Detener / limpiar
+
+```bash
+podman compose -f podman-compose.yml down        # detener
+podman compose -f podman-compose.yml down -v     # detener y borrar datos
+```
+
+### Servicios del compose
+
+| Servicio   | Imagen                                  | Puerto host | Notas |
+|------------|-----------------------------------------|-------------|-------|
+| postgres   | `docker.io/library/postgres:16-alpine`  | `5434`      | healthcheck `pg_isready` |
+| kafka      | `docker.io/apache/kafka:4.2.0`          | —           | broker Apache Kafka (KRaft) en `kafka:9092` |
+| minibanco  | build local (`Containerfile`)           | `8080`      | perfil `prod`, se conecta por nombre de servicio |
+
+## Datos de prueba (se siembran automáticamente)
+
+**Usuarios de prueba** (login simple, sin base de datos):
+
+| Usuario    | Contraseña    | Rol       |
+|------------|---------------|-----------|
+| `admin`    | `admin123`    | `ADMIN`   |
+| `customer` | `customer123` | `CUSTOMER`|
+
+**Clientes y cuentas**:
+
+| Cliente     | Documento  | Cuenta        | Moneda | Saldo inicial |
+|-------------|------------|---------------|--------|---------------|
+| Ana Rojas   | 45678912   | `PEN-000001`  | PEN    | 10000.00 |
+| Ana Rojas   | 45678912   | `USD-000001`  | USD    | 6000.00  |
+| Luis Perez  | 87654321   | `PEN-000002`  | PEN    | 2500.00  |
+
+## Cómo obtener el token
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r .accessToken)
+```
+
+Respuesta del login:
+
+```json
+{ "accessToken": "eyJ...", "tokenType": "Bearer", "expiresIn": 3600 }
+```
+
+## Endpoints principales
+
+| Método | Ruta | Rol | Descripción |
+|--------|------|-----|-------------|
+| POST   | `/api/auth/login` | público | Emite un JWT |
+| GET    | `/api/customers` | ADMIN | Lista clientes |
+| POST   | `/api/customers` | ADMIN | Crea cliente |
+| GET    | `/api/customers/{id}` | ADMIN | Detalle de cliente |
+| PUT    | `/api/customers/{id}` | ADMIN | Actualiza cliente |
+| DELETE | `/api/customers/{id}` | ADMIN | Elimina cliente |
+| POST   | `/api/accounts` | CUSTOMER, ADMIN | Abre cuenta |
+| GET    | `/api/accounts/{number}` | CUSTOMER, ADMIN | Detalle de cuenta |
+| DELETE | `/api/accounts/{number}` | ADMIN | Cierra cuenta (saldo 0) |
+| POST   | `/api/accounts/{number}/deposits` | CUSTOMER | Depósito |
+| POST   | `/api/accounts/{number}/transfers` | CUSTOMER | Transferencia |
+| GET    | `/api/transactions` | ADMIN | Lista transacciones |
+| GET    | `/api/transactions/{id}` | ADMIN | Detalle de transacción |
+| GET    | `/api/alerts` | ADMIN | Lista alertas antifraude |
+
+### Ejemplos `curl`
+
+```bash
+BASE=http://localhost:8080/api
+
+# Token de admin y de cliente
+ADMIN_TOKEN=$(curl -s -X POST $BASE/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r .accessToken)
+CUSTOMER_TOKEN=$(curl -s -X POST $BASE/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"customer","password":"customer123"}' | jq -r .accessToken)
+
+# Crear cliente (ADMIN)
+curl -s -X POST $BASE/customers -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Carlos Test","document":"11112222","email":"carlos@minibanco.test"}'
+
+# Abrir cuenta (ADMIN) para el cliente con id 1
+curl -s -X POST $BASE/accounts -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"number":"PEN-000003","customerId":1,"currency":"PEN"}'
+
+# Depósito (CUSTOMER)
+curl -s -X POST $BASE/accounts/PEN-000001/deposits -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"amount":500.00,"description":"Deposito demo"}'
+
+# Transferencia misma moneda (CUSTOMER)
+curl -s -X POST $BASE/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"destinationAccountNumber":"PEN-000002","amount":100.00,"description":"Transferencia demo"}'
+
+# Transferencia entre monedas (CUSTOMER) -> usa el tipo de cambio externo
+curl -s -X POST $BASE/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"destinationAccountNumber":"USD-000001","amount":200.00,"description":"Cambio PEN->USD"}'
+
+# Consultar cuenta
+curl -s $BASE/accounts/PEN-000001 -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Listar transacciones (ADMIN)
+curl -s $BASE/transactions -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Listar alertas antifraude (ADMIN)
+curl -s $BASE/alerts -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+## Reglas de antifraude
+
+El consumidor Kafka, por cada transferencia, genera una alerta si:
+
+- El monto convertido supera **USD 5000**, o
+- Se registran **5 o más transferencias** desde la misma cuenta en **5 minutos**.
+
+## Códigos HTTP
+
+| Código | Cuándo |
+|--------|--------|
+| 201 | Recurso creado (cliente, cuenta, depósito, transferencia) |
+| 204 | Recurso cerrado/eliminado |
+| 400 | Error de validación (`VALIDATION_ERROR`) |
+| 401 | Credenciales inválidas / sin token |
+| 403 | Rol insuficiente |
+| 404 | Recurso no encontrado (`ACCOUNT_NOT_FOUND`, ...) |
+| 409 | Conflicto (`CUSTOMER_DOCUMENT_ALREADY_EXISTS`, ...) |
+| 422 | Regla de negocio (`INSUFFICIENT_BALANCE`, ...) |
+| 503 | API de tipo de cambio no disponible |
+
+Todas las excepciones devuelven un JSON uniforme:
+
+```json
+{ "code": "INSUFFICIENT_BALANCE", "message": "Insufficient balance: ...", "timestamp": "2026-01-01T00:00:00Z" }
+```
+
+## Documentación interactiva (OpenAPI / Swagger UI)
+
+En modo desarrollo (`./mvnw quarkus:dev`):
+
+- Dev UI: <http://localhost:8080/q/dev/>
+- Swagger UI: <http://localhost:8080/q/swagger-ui/>
+
+## Desarrollo local (sin contenedores para la app)
+
+```bash
 ./mvnw quarkus:dev
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+Quarkus levanta automáticamente **PostgreSQL** y **Kafka** con *Dev Services*
+(requiere un runtime de contenedores disponible).
 
-## Packaging and running the application
+## Pruebas
 
-The application can be packaged using:
-
-```shell script
-./mvnw package
+```bash
+./mvnw test
 ```
 
-It produces the `quarkus-run.jar` file in the `target/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `target/quarkus-app/lib/` directory.
-
-The application is now runnable using `java -jar target/quarkus-app/quarkus-run.jar`.
-
-If you want to build an _über-jar_, execute the following command:
-
-```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
-```
-
-The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.
-
-## Creating a native executable
-
-You can create a native executable using:
-
-```shell script
-./mvnw package -Dnative
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./mvnw package -Dnative -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./target/code-with-quarkus-1.0.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/maven-tooling>.
-
-## Related Guides
-
-- Hibernate Validator ([guide](https://quarkus.io/guides/validation)): Bean validation using Hibernate Validator and Jakarta Validation annotations
-- SmallRye OpenAPI ([guide](https://quarkus.io/guides/openapi-swaggerui)): Generate OpenAPI schemas and serve Swagger UI for REST API documentation
-- REST Jackson ([guide](https://quarkus.io/guides/rest#json-serialisation)): Jackson serialization support for Quarkus REST. This extension is not compatible with the quarkus-resteasy extension, or any of the extensions that depend on it
-- Messaging - Kafka Connector ([guide](https://quarkus.io/guides/kafka-getting-started)): Connect to Kafka with Reactive Messaging
-- Hibernate ORM with Panache ([guide](https://quarkus.io/guides/hibernate-orm-panache)): Simplified JPA/Hibernate data access layer with active record and repository patterns
-- SmallRye JWT ([guide](https://quarkus.io/guides/security-jwt)): Secure your applications with JSON Web Token
-- SmallRye JWT Build ([guide](https://quarkus.io/guides/security-jwt-build)): Create JSON Web Token with SmallRye JWT Build API
-- JDBC Driver - PostgreSQL ([guide](https://quarkus.io/guides/datasource)): Connect to the PostgreSQL database via JDBC
-
-## Provided Code
-
-### Hibernate ORM
-
-Create your first JPA entity
-
-[Related guide section...](https://quarkus.io/guides/hibernate-orm)
-
-
-[Related Hibernate with Panache section...](https://quarkus.io/guides/hibernate-orm-panache)
-
-
-### Messaging codestart
-
-Use Quarkus Messaging
-
-[Related Apache Kafka guide section...](https://quarkus.io/guides/kafka-reactive-getting-started)
-
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+Los tests de integración usan Dev Services (PostgreSQL + Kafka) y mockean
+`ExchangeRateClient`.

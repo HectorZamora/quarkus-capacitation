@@ -15,7 +15,7 @@ import org.acme.repository.CustomerRepository;
 import java.math.BigDecimal;
 
 @ApplicationScoped
-@IfBuildProfile(anyOf = {"dev", "test"})
+@IfBuildProfile(anyOf = {"dev", "test", "prod"})
 public class DemoDataInitializer {
 
     @Inject
