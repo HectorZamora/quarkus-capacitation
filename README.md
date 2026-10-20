@@ -1,44 +1,52 @@
-# MiniBanco - API bancaria con Quarkus
+# MiniBanco - Arquitectura de microservicios con Quarkus
 
 Proyecto de evidencia para la capacitación de **Quarkus**. Implementa un mini
-banco: gestión de clientes y cuentas, depósitos, transferencias (mismo moneda y
-entre monedas), y un motor antifraude que genera **alertas** a partir de eventos
-de transferencia publicados en **Kafka**.
+banco dividido en dos backends independientes que se comunican de forma
+asíncrona mediante **Kafka**:
+
+- **`banking-service`**: clientes, cuentas, depósitos, transferencias y consulta
+  de transacciones. Es el dueño de la base de datos bancaria y el productor de
+  los eventos de transferencia.
+- **`alert-service`**: consumidor antifraude. Evalúa los eventos, persiste las
+  alertas en su propia base de datos y las expone por REST.
 
 ## Proceso de negocio
 
 1. Un **administrador** da de alta clientes y abre cuentas (PEN o USD).
 2. Un **cliente** (rol `CUSTOMER`) deposita y transfiere dinero.
-3. Si la transferencia es entre monedas distintas, la app consulta una **API
-   externa de tipo de cambio** (con tolerancia a fallos) y guarda la tasa aplicada.
-4. Al confirmarse la transacción, se publica un evento en **Kafka**.
-5. Un **consumidor antifraude** evalúa la regla de negocio y, si se cumple,
-   persiste una **Alerta** (consultable solo por administradores).
+3. Si la transferencia es entre monedas distintas, `banking-service` consulta
+   una **API externa de tipo de cambio** (con timeout y fallback) y guarda la
+   tasa aplicada.
+4. Al confirmarse la transacción, `banking-service` publica un
+   `TransferCompletedEvent` en el tópico Kafka `transfers`.
+5. `alert-service` consume el evento, aplica las reglas antifraude y, si
+   corresponde, persiste una **Alerta** en su propia BD.
+6. Un administrador consulta las alertas en `alert-service`.
 
 ### Diagrama de flujo
 
 ```mermaid
 flowchart LR
-    U[Cliente / Admin] -->|JWT Bearer| API[API REST Quarkus]
-    API --> SVC[Servicios @Transactional]
-    SVC --> DB[(PostgreSQL)]
-    SVC -->|monedas distintas| FX[API tipo de cambio<br/>open.er-api.com]
-    SVC -->|transferencia OK| K[(Kafka)]
-    K --> AF[Consumidor antifraude]
-    AF -->|regla cumplida| DB
-    API -->|GET /alerts| DB
+    U[Cliente / Admin] -->|JWT Bearer| B[banking-service :8080]
+    B --> BDB[(PostgreSQL<br/>minibanco)]
+    B -->|monedas distintas| FX[API tipo de cambio<br/>open.er-api.com]
+    B -->|transferencia OK| K[(Kafka<br/>topic transfers)]
+    K --> A[alert-service :8081]
+    A --> ADB[(PostgreSQL<br/>alertdb)]
+    U -->|GET /api/alerts| A
 ```
 
 ```
- Cliente/Admin ──JWT──▶ REST ──▶ Service @Transactional ──▶ PostgreSQL
-                                    │
-                                    ├─(distinta moneda)─▶ API tipo de cambio (Fallback/Timeout)
-                                    └─(transferencia OK)─▶ Kafka "transfers"
-                                                                   │
-                                                                   ▼
-                                                     Consumidor antifraude
-                                                                   │
-                                                          (regla) ─┴─▶ Alerta (PostgreSQL)
+ Cliente/Admin ──JWT──▶ banking-service ──▶ PostgreSQL (minibanco)
+                              │
+                              ├─(distinta moneda)─▶ API tipo de cambio
+                              └─(transferencia OK)─▶ Kafka "transfers"
+                                                           │
+                                                           ▼
+                                                    alert-service
+                                                           │
+                                                           ├─▶ PostgreSQL (alertdb)
+                                                           └─▶ GET /api/alerts (ADMIN)
 ```
 
 ## Stack
@@ -54,63 +62,78 @@ flowchart LR
 | Mensajería            | Kafka (SmallRye Reactive Messaging) |
 | Contenedores          | Podman + podman-compose |
 
-## Estructura de capas
+## Estructura del repositorio
 
 ```
-resource/     Endpoints REST (HTTP status, validación, roles)
-service/      Lógica de negocio (@Transactional)
-repository/   PanacheRepository (consultas)
-entity/       Modelo JPA (Customer, Account, Transaction, Alert)
-dto/          request/ y response/ separados de las entidades
-mapper/       BankMapper (entidad -> DTO)
-messaging/    Productor/consumidor Kafka y evento
-client/       ExchangeRateClient (@RegisterRestClient)
-exception/    Excepciones + ExceptionMapper (error JSON uniforme)
-security/     Constantes de roles
+.
+├── pom.xml                     # POM agregador (parent de los dos módulos)
+├── mvnw / mvnw.cmd / .mvn/     # Maven Wrapper compartido
+├── podman-compose.yml          # PostgreSQL x2 + Kafka + los dos backends
+├── banking-service/
+│   ├── pom.xml
+│   ├── Containerfile
+│   └── src/
+│       ├── main/java/org/acme/
+│       │   ├── resource/       # Auth, Customer, Account, Transaction
+│       │   ├── service/        # Lógica bancaria y tipo de cambio
+│       │   ├── repository/     # Panache
+│       │   ├── entity/         # Customer, Account, Transaction
+│       │   ├── dto/ + mapper/
+│       │   ├── messaging/      # TransferCompletedEvent + productor Kafka
+│       │   ├── client/         # ExchangeRateClient
+│       │   ├── exception/      # Excepciones + ExceptionMapper
+│       │   └── security/       # Roles
+│       └── main/resources/     # application.properties, claves JWT
+└── alert-service/
+    ├── pom.xml
+    ├── Containerfile
+    └── src/
+        ├── main/java/org/acme/
+        │   ├── resource/       # AlertResource
+        │   ├── service/        # AlertService
+        │   ├── repository/     # AlertRepository, ProcessedTransferRepository
+        │   ├── entity/         # Alert, ProcessedTransfer, Currency
+        │   ├── dto/
+        │   ├── messaging/      # Consumidor Kafka + evento/deserializador
+        │   └── security/       # Roles
+        └── main/resources/     # application.properties, publicKey.pem
 ```
 
 ## Cómo levantarlo con Podman
 
 ### Requisitos
 
-- Podman (con una máquina corriendo: `podman machine start`).
+- Podman con una máquina corriendo (`podman machine start`).
 - Java 21 + Maven Wrapper (incluido `mvnw`).
-
-> El proyecto está configurado para usar **Podman puro**: `podman compose` invoca
-> a **`podman-compose`** (no al `docker-compose` de Docker Desktop). En Windows,
-> instala `podman-compose` con `pip install podman-compose` y registra el proveedor
-> en `%APPDATA%\containers\containers.conf`:
->
-> ```toml
-> [engine]
-> compose_providers=['C:\ruta\a\Scripts\podman-compose.exe']
-> ```
+- `podman-compose` (en Windows se integra con `podman compose`).
 
 ### Pasos
 
 ```bash
-# 1) (Opcional pero recomendado) Autenticarse en Docker Hub para evitar el
-#    límite de descargas anónimas
+# 1) (Opcional) Autenticarse en Docker Hub para evitar límites de descarga
 podman login docker.io
 
-# 2) Compilar la aplicación (genera target/quarkus-app)
+# 2) Compilar ambos módulos (genera target/quarkus-app en cada uno)
 ./mvnw package
 
-# 3) Levantar el stack completo (postgres + kafka + minibanco)
+# 3) Construir imágenes y levantar todo el stack
 podman compose -f podman-compose.yml up --build -d
 
 # 4) Ver el estado
 podman compose -f podman-compose.yml ps
 ```
 
-La API queda disponible en `http://localhost:8080/api`.
+Servicios disponibles:
 
-> El `minibanco` se construye con el **`Containerfile`** de la raíz (equivalente
-> al `src/main/docker/Dockerfile.jvm` que genera Quarkus). El comando
-> `podman compose ... up --build -d` ya usa `podman-compose`, por lo que no se
-> requiere Docker. También puedes ejecutar directamente
-> `podman-compose -f podman-compose.yml up --build -d` si tienes `podman-compose`
-> en el `PATH`.
+- API bancaria: `http://localhost:8080/api`
+- API de alertas: `http://localhost:8081/api`
+- Swagger UI bancario: `http://localhost:8080/q/swagger-ui/`
+- Swagger UI alertas: `http://localhost:8081/q/swagger-ui/`
+
+> Cada módulo tiene su propio `Containerfile` (runtime JVM sobre
+> `ubi9/openjdk-21-runtime`). `podman compose ... --build` construye ambas
+> imágenes usando como contexto la carpeta de cada servicio. No se requiere
+> Docker Desktop.
 
 ### Detener / limpiar
 
@@ -121,13 +144,19 @@ podman compose -f podman-compose.yml down -v     # detener y borrar datos
 
 ### Servicios del compose
 
-| Servicio   | Imagen                                  | Puerto host | Notas |
-|------------|-----------------------------------------|-------------|-------|
-| postgres   | `docker.io/library/postgres:16-alpine`  | `5434`      | healthcheck `pg_isready` |
-| kafka      | `docker.io/apache/kafka:4.2.0`          | —           | broker Apache Kafka (KRaft) en `kafka:9092` |
-| minibanco  | build local (`Containerfile`)           | `8080`      | perfil `prod`, se conecta por nombre de servicio |
+| Servicio       | Imagen                                  | Puerto host | Notas |
+|----------------|-----------------------------------------|-------------|-------|
+| postgres       | `docker.io/library/postgres:16-alpine`  | `5434`      | BD de `banking-service` (`minibanco`) |
+| postgres-alert | `docker.io/library/postgres:16-alpine`  | `5435`      | BD de `alert-service` (`alertdb`) |
+| kafka          | `docker.io/apache/kafka:4.2.0`          | `9092`      | KRaft, listeners interno `kafka:9092` y externo `localhost:9092` |
+| banking-service| build local (`banking-service/Containerfile`) | `8080` | perfil `prod`, produce en `transfers` |
+| alert-service  | build local (`alert-service/Containerfile`)   | `8081` | perfil `prod`, consume `transfers` |
 
-## Datos de prueba (se siembran automáticamente)
+El tópico `transfers` se crea automáticamente (3 particiones). El productor usa
+`sourceAccountNumber` como **clave**, de modo que las transferencias de una
+misma cuenta caen en la misma partición y se consumen en orden.
+
+## Datos de prueba (se siembran en `banking-service`)
 
 **Usuarios de prueba** (login simple, sin base de datos):
 
@@ -144,21 +173,21 @@ podman compose -f podman-compose.yml down -v     # detener y borrar datos
 | Ana Rojas   | 45678912   | `USD-000001`  | USD    | 6000.00  |
 | Luis Perez  | 87654321   | `PEN-000002`  | PEN    | 2500.00  |
 
-## Cómo obtener el token
+`alert-service` no siembra datos: las alertas se generan a partir de los
+eventos de transferencia.
 
-```bash
-TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}' | jq -r .accessToken)
-```
+## Seguridad entre servicios
 
-Respuesta del login:
+- `banking-service` emite el JWT en `POST /api/auth/login`, firmado con
+  `privateKey.pem` (claim `groups` con el rol).
+- `alert-service` **no emite tokens**: valida el mismo JWT con `publicKey.pem` y
+  el issuer `minibanco-api`.
+- Por eso el token obtenido en el puerto `8080` se usa también para consultar
+  `GET http://localhost:8081/api/alerts` con rol `ADMIN`.
 
-```json
-{ "accessToken": "eyJ...", "tokenType": "Bearer", "expiresIn": 3600 }
-```
+## Endpoints
 
-## Endpoints principales
+### `banking-service` (`http://localhost:8080/api`)
 
 | Método | Ruta | Rol | Descripción |
 |--------|------|-----|-------------|
@@ -175,60 +204,69 @@ Respuesta del login:
 | POST   | `/api/accounts/{number}/transfers` | CUSTOMER | Transferencia |
 | GET    | `/api/transactions` | ADMIN | Lista transacciones |
 | GET    | `/api/transactions/{id}` | ADMIN | Detalle de transacción |
+
+### `alert-service` (`http://localhost:8081/api`)
+
+| Método | Ruta | Rol | Descripción |
+|--------|------|-----|-------------|
 | GET    | `/api/alerts` | ADMIN | Lista alertas antifraude |
 
 ### Ejemplos `curl`
 
 ```bash
-BASE=http://localhost:8080/api
+BANK=http://localhost:8080/api
+ALERTS=http://localhost:8081/api
 
-# Token de admin y de cliente
-ADMIN_TOKEN=$(curl -s -X POST $BASE/auth/login -H "Content-Type: application/json" \
+# Tokens (se emiten en banking-service)
+ADMIN_TOKEN=$(curl -s -X POST $BANK/auth/login -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"admin123"}' | jq -r .accessToken)
-CUSTOMER_TOKEN=$(curl -s -X POST $BASE/auth/login -H "Content-Type: application/json" \
+CUSTOMER_TOKEN=$(curl -s -X POST $BANK/auth/login -H "Content-Type: application/json" \
   -d '{"username":"customer","password":"customer123"}' | jq -r .accessToken)
 
 # Crear cliente (ADMIN)
-curl -s -X POST $BASE/customers -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -s -X POST $BANK/customers -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"Carlos Test","document":"11112222","email":"carlos@minibanco.test"}'
 
-# Abrir cuenta (ADMIN) para el cliente con id 1
-curl -s -X POST $BASE/accounts -H "Authorization: Bearer $ADMIN_TOKEN" \
+# Abrir cuenta (ADMIN)
+curl -s -X POST $BANK/accounts -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"number":"PEN-000003","customerId":1,"currency":"PEN"}'
 
 # Depósito (CUSTOMER)
-curl -s -X POST $BASE/accounts/PEN-000001/deposits -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+curl -s -X POST $BANK/accounts/PEN-000001/deposits -H "Authorization: Bearer $CUSTOMER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"amount":500.00,"description":"Deposito demo"}'
 
 # Transferencia misma moneda (CUSTOMER)
-curl -s -X POST $BASE/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+curl -s -X POST $BANK/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"destinationAccountNumber":"PEN-000002","amount":100.00,"description":"Transferencia demo"}'
 
 # Transferencia entre monedas (CUSTOMER) -> usa el tipo de cambio externo
-curl -s -X POST $BASE/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+curl -s -X POST $BANK/accounts/PEN-000001/transfers -H "Authorization: Bearer $CUSTOMER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"destinationAccountNumber":"USD-000001","amount":200.00,"description":"Cambio PEN->USD"}'
 
-# Consultar cuenta
-curl -s $BASE/accounts/PEN-000001 -H "Authorization: Bearer $ADMIN_TOKEN"
-
 # Listar transacciones (ADMIN)
-curl -s $BASE/transactions -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s $BANK/transactions -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# Listar alertas antifraude (ADMIN)
-curl -s $BASE/alerts -H "Authorization: Bearer $ADMIN_TOKEN"
+# Listar alertas antifraude (ADMIN) en el OTRO servicio
+curl -s $ALERTS/alerts -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 ## Reglas de antifraude
 
-El consumidor Kafka, por cada transferencia, genera una alerta si:
+`alert-service` evalúa cada `TransferCompletedEvent` y genera una alerta si:
 
 - El monto convertido supera **USD 5000**, o
 - Se registran **5 o más transferencias** desde la misma cuenta en **5 minutos**.
+
+Para la segunda regla, `alert-service` guarda su propia copia de cada evento en
+la tabla `processed_transfers`; así no consulta la base de datos de
+`banking-service`. La tabla tiene un índice único por `transaction_id` y
+`alerts` también, lo que hace el consumo **idempotente** ante reentregas de
+Kafka (semántica *at-least-once*).
 
 ## Códigos HTTP
 
@@ -244,7 +282,7 @@ El consumidor Kafka, por cada transferencia, genera una alerta si:
 | 422 | Regla de negocio (`INSUFFICIENT_BALANCE`, ...) |
 | 503 | API de tipo de cambio no disponible |
 
-Todas las excepciones devuelven un JSON uniforme:
+Todas las excepciones de `banking-service` devuelven un JSON uniforme:
 
 ```json
 { "code": "INSUFFICIENT_BALANCE", "message": "Insufficient balance: ...", "timestamp": "2026-01-01T00:00:00Z" }
@@ -252,25 +290,63 @@ Todas las excepciones devuelven un JSON uniforme:
 
 ## Documentación interactiva (OpenAPI / Swagger UI)
 
-En modo desarrollo (`./mvnw quarkus:dev`):
+Con el stack levantado:
 
-- Dev UI: <http://localhost:8080/q/dev/>
-- Swagger UI: <http://localhost:8080/q/swagger-ui/>
+- Banking: `http://localhost:8080/q/swagger-ui/`
+- Alerts: `http://localhost:8081/q/swagger-ui/`
 
-## Desarrollo local (sin contenedores para la app)
+## Desarrollo local (sin contenedores para las apps)
+
+Kafka debe estar corriendo en `localhost:9092`; se puede levantar solo el broker
+con Podman:
 
 ```bash
-./mvnw quarkus:dev
+podman compose -f podman-compose.yml up -d kafka
 ```
 
-Quarkus levanta automáticamente **PostgreSQL** y **Kafka** con *Dev Services*
-(requiere un runtime de contenedores disponible).
+Luego, en dos terminales:
+
+```bash
+# Terminal 1 - servicio bancario (Dev Services levanta su PostgreSQL)
+./mvnw -pl banking-service quarkus:dev
+
+# Terminal 2 - servicio de alertas (Dev Services levanta su PostgreSQL en 5433)
+./mvnw -pl alert-service quarkus:dev
+```
+
+En modo `dev`, ambos servicios están configurados para usar el Kafka externo en
+`localhost:9092` y **no** levantar un Kafka por Dev Services. Cada uno sí levanta
+su PostgreSQL con Dev Services (puertos `5432` y `5433`).
+
+No mezcles el stack completo de compose con `quarkus:dev`: ambos intentarían
+usar el puerto `8080` (banking) o `8081` (alerts).
 
 ## Pruebas
 
 ```bash
+# Ambos módulos
 ./mvnw test
+
+# Solo uno
+./mvnw -pl banking-service test
+./mvnw -pl alert-service test
 ```
 
-Los tests de integración usan Dev Services (PostgreSQL + Kafka) y mockean
-`ExchangeRateClient`.
+- `banking-service`: tests de recursos, persistencia, seguridad y tipo de cambio.
+- `alert-service`: tests del consumidor Kafka y del endpoint `/alerts`
+  (incluye 401 sin token y 403 para `CUSTOMER`).
+- Los tests usan **Dev Services** (PostgreSQL + Kafka) con Testcontainers sobre
+  Podman.
+
+## Notas de diseño
+
+- Cada servicio es dueño de su base de datos; no hay acceso cruzado a tablas.
+- El contrato es el evento JSON `TransferCompletedEvent`, replicado en ambos
+  módulos. En una evolución real se podría extraer a una librería compartida o
+  usar un Schema Registry (Avro/Protobuf).
+- `banking-service` publica el evento **después del commit** de la transacción
+  (`@Observes(during = AFTER_SUCCESS)`), evitando alertas de transferencias que
+  finalmente fallaron.
+- El envío a Kafka es *fire-and-forget*: si Kafka no está disponible, la
+  transferencia ya confirmada no se revierte. Para garantías más fuertes se
+  podría implementar el patrón **Transactional Outbox**.
